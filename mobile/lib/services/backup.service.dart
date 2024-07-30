@@ -37,6 +37,9 @@ class BackupService {
   final Isar _db;
   final Logger _log = Logger("BackupService");
   final AppSettingsService _appSetting;
+  DateTime lastProgressUpdate = DateTime.now();
+  bool canceledByIncativity = false;
+  Timer? inactivityTimer;
 
   BackupService(this._apiService, this._db, this._appSetting);
 
@@ -243,6 +246,9 @@ class BackupService {
         : assetList.toList();
 
     for (var entity in assetsToUpload) {
+      http.CancellationToken uploadCancelToken = http.CancellationToken();
+      http.CancellationToken uploadAndCancelToken =
+          uploadCancelToken.merge(cancelToken);
       File? file;
       File? livePhotoFile;
 
@@ -307,11 +313,15 @@ class BackupService {
             filename: originalFileName,
           );
 
+          lastProgressUpdate = DateTime.now();
           var baseRequest = MultipartRequest(
             'POST',
             Uri.parse('$savedEndpoint/assets'),
-            onProgress: ((bytes, totalBytes) =>
-                uploadProgressCb(bytes, totalBytes)),
+            onProgress: ((bytes, totalBytes) => {
+                  // Take current time
+                  lastProgressUpdate = DateTime.now(),
+                  uploadProgressCb(bytes, totalBytes),
+                }),
           );
           baseRequest.headers.addAll(ApiService.getRequestHeaders());
           baseRequest.headers["Transfer-Encoding"] = "chunked";
@@ -348,7 +358,7 @@ class BackupService {
               originalFileName,
               livePhotoFile,
               baseRequest,
-              cancelToken,
+              uploadAndCancelToken,
             );
           }
 
@@ -356,10 +366,20 @@ class BackupService {
             baseRequest.fields['livePhotoVideoId'] = livePhotoVideoId;
           }
 
+          // set interval to check if last progress update was more than 5 seconds ago
+          inactivityTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+            if (DateTime.now().difference(lastProgressUpdate).inSeconds > 5) {
+              canceledByIncativity = true;
+              timer.cancel();
+              uploadCancelToken.cancel();
+            }
+          });
+          canceledByIncativity = false;
           var response = await httpClient.send(
             baseRequest,
-            cancellationToken: cancelToken,
+            cancellationToken: uploadAndCancelToken,
           );
+          inactivityTimer?.cancel();
 
           var responseBody = jsonDecode(await response.stream.bytesToString());
 
@@ -398,6 +418,10 @@ class BackupService {
           uploadSuccessCb(entity.id, deviceId, isDuplicate);
         }
       } on http.CancelledException {
+        if (canceledByIncativity) {
+          debugPrint("Backup was cancelled by inactivity");
+          continue;
+        }
         debugPrint("Backup was cancelled by the user");
         anyErrors = true;
         break;
@@ -406,6 +430,7 @@ class BackupService {
         anyErrors = true;
         continue;
       } finally {
+        inactivityTimer?.cancel();
         if (Platform.isIOS) {
           try {
             await file?.delete();
@@ -452,10 +477,19 @@ class BackupService {
 
     livePhotoReq.files.add(livePhotoRawUploadData);
 
+    inactivityTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      if (DateTime.now().difference(lastProgressUpdate).inSeconds > 5) {
+        canceledByIncativity = true;
+        timer.cancel();
+        cancelToken.cancel();
+      }
+    });
+    canceledByIncativity = false;
     var response = await httpClient.send(
       livePhotoReq,
       cancellationToken: cancelToken,
     );
+    inactivityTimer?.cancel();
 
     var responseBody = jsonDecode(await response.stream.bytesToString());
 
